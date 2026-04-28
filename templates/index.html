@@ -1,1 +1,344 @@
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import sqlite3
+from datetime import datetime
 
+app = Flask(__name__, static_folder='static', template_folder='templates')
+CORS(app)
+
+DB_PATH = 'os_system.db'
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS maquinas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL,
+        setor TEXT NOT NULL,
+        modelo TEXT,
+        patrimonio TEXT UNIQUE,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS responsaveis (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL,
+        email TEXT,
+        telefone TEXT,
+        especialidade TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS ordens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        titulo TEXT NOT NULL,
+        descricao TEXT,
+        maquina_id INTEGER,
+        responsavel_id INTEGER,
+        prioridade TEXT DEFAULT 'media',
+        status TEXT DEFAULT 'aberta',
+        tipo TEXT DEFAULT 'corretiva',
+        solicitante TEXT,
+        observacoes TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        fechado_at TEXT,
+        FOREIGN KEY (maquina_id) REFERENCES maquinas(id),
+        FOREIGN KEY (responsavel_id) REFERENCES responsaveis(id)
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS historico (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ordem_id INTEGER,
+        acao TEXT,
+        descricao TEXT,
+        usuario TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (ordem_id) REFERENCES ordens(id)
+    )''')
+
+    conn.commit()
+    conn.close()
+
+# ── Routes ──────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    return send_from_directory('templates', 'index.html')
+
+# ── Ordens ──────────────────────────────────────────────
+
+@app.route('/api/ordens', methods=['GET'])
+def list_ordens():
+    conn = get_db()
+    status = request.args.get('status', '')
+    search = request.args.get('q', '')
+    query = '''SELECT o.*, m.nome as maquina_nome, m.setor, r.nome as responsavel_nome
+               FROM ordens o
+               LEFT JOIN maquinas m ON o.maquina_id = m.id
+               LEFT JOIN responsaveis r ON o.responsavel_id = r.id
+               WHERE 1=1'''
+    params = []
+    if status:
+        query += ' AND o.status = ?'
+        params.append(status)
+    if search:
+        query += ' AND (o.titulo LIKE ? OR m.nome LIKE ?)'
+        params += [f'%{search}%', f'%{search}%']
+    query += ' ORDER BY o.created_at DESC'
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/ordens', methods=['POST'])
+def create_ordem():
+    data = request.json
+    conn = get_db()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cur = conn.execute('''INSERT INTO ordens
+        (titulo, descricao, maquina_id, responsavel_id, prioridade, tipo, solicitante, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)''',
+        (data['titulo'], data.get('descricao', ''),
+         data.get('maquina_id') or None,
+         data.get('responsavel_id') or None,
+         data.get('prioridade', 'media'),
+         data.get('tipo', 'corretiva'),
+         data.get('solicitante', ''), 'aberta', now, now))
+    ordem_id = cur.lastrowid
+    conn.execute('INSERT INTO historico (ordem_id, acao, descricao, usuario, created_at) VALUES (?,?,?,?,?)',
+                 (ordem_id, 'Criação', f'OS criada por {data.get("solicitante","Sistema")}',
+                  data.get('solicitante', 'Sistema'), now))
+    conn.commit()
+    conn.close()
+    return jsonify({'id': ordem_id, 'message': 'OS criada com sucesso'}), 201
+
+@app.route('/api/ordens/<int:ordem_id>', methods=['GET'])
+def get_ordem(ordem_id):
+    conn = get_db()
+    row = conn.execute('''SELECT o.*, m.nome as maquina_nome, m.setor, m.modelo, m.patrimonio,
+                          r.nome as responsavel_nome, r.email as responsavel_email
+                          FROM ordens o
+                          LEFT JOIN maquinas m ON o.maquina_id = m.id
+                          LEFT JOIN responsaveis r ON o.responsavel_id = r.id
+                          WHERE o.id = ?''', (ordem_id,)).fetchone()
+    hist = conn.execute('SELECT * FROM historico WHERE ordem_id = ? ORDER BY created_at DESC',
+                        (ordem_id,)).fetchall()
+    conn.close()
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'ordem': dict(row), 'historico': [dict(h) for h in hist]})
+
+@app.route('/api/ordens/<int:ordem_id>/status', methods=['PUT'])
+def update_status(ordem_id):
+    data = request.json
+    novo_status = data['status']
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = get_db()
+    fechado = now if novo_status == 'concluida' else None
+    conn.execute('UPDATE ordens SET status=?, updated_at=?, fechado_at=?, observacoes=? WHERE id=?',
+                 (novo_status, now, fechado, data.get('observacoes'), ordem_id))
+    conn.execute('INSERT INTO historico (ordem_id, acao, descricao, usuario, created_at) VALUES (?,?,?,?,?)',
+                 (ordem_id, 'Status', f'Status alterado para: {novo_status}',
+                  data.get('usuario', 'Sistema'), now))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': 'Status atualizado'})
+
+@app.route('/api/ordens/<int:ordem_id>/atribuir', methods=['PUT'])
+def atribuir_responsavel(ordem_id):
+    data = request.json
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = get_db()
+    conn.execute('UPDATE ordens SET responsavel_id=?, status=?, updated_at=? WHERE id=?',
+                 (data['responsavel_id'], 'em_andamento', now, ordem_id))
+    resp = conn.execute('SELECT nome FROM responsaveis WHERE id=?', (data['responsavel_id'],)).fetchone()
+    conn.execute('INSERT INTO historico (ordem_id, acao, descricao, usuario, created_at) VALUES (?,?,?,?,?)',
+                 (ordem_id, 'Atribuição', f'Atribuído a {resp["nome"] if resp else "—"}', 'Sistema', now))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': 'Responsável atribuído'})
+
+# ── Máquinas ────────────────────────────────────────────
+
+@app.route('/api/maquinas', methods=['GET'])
+def list_maquinas():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM maquinas ORDER BY nome').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/maquinas', methods=['POST'])
+def create_maquina():
+    data = request.json
+    if not data.get('nome') or not data.get('setor'):
+        return jsonify({'error': 'Nome e setor são obrigatórios'}), 400
+    conn = get_db()
+    try:
+        cur = conn.execute('INSERT INTO maquinas (nome, setor, modelo, patrimonio) VALUES (?,?,?,?)',
+                           (data['nome'], data['setor'],
+                            data.get('modelo', ''), data.get('patrimonio', '') or None))
+        conn.commit()
+        return jsonify({'id': cur.lastrowid}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Número de patrimônio já cadastrado'}), 409
+    finally:
+        conn.close()
+
+@app.route('/api/maquinas/<int:mid>', methods=['PUT'])
+def update_maquina(mid):
+    data = request.json
+    if not data.get('nome') or not data.get('setor'):
+        return jsonify({'error': 'Nome e setor são obrigatórios'}), 400
+    conn = get_db()
+    try:
+        conn.execute('UPDATE maquinas SET nome=?, setor=?, modelo=?, patrimonio=? WHERE id=?',
+                     (data['nome'], data['setor'],
+                      data.get('modelo', ''), data.get('patrimonio', '') or None, mid))
+        conn.commit()
+        return jsonify({'message': 'Máquina atualizada'})
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Número de patrimônio já cadastrado'}), 409
+    finally:
+        conn.close()
+
+@app.route('/api/maquinas/<int:mid>', methods=['DELETE'])
+def delete_maquina(mid):
+    conn = get_db()
+    total = conn.execute('SELECT COUNT(*) as c FROM ordens WHERE maquina_id=?', (mid,)).fetchone()['c']
+    if total > 0:
+        conn.close()
+        return jsonify({'error': f'Não é possível excluir: há {total} OS vinculada(s) a esta máquina'}), 409
+    conn.execute('DELETE FROM maquinas WHERE id=?', (mid,))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': 'Máquina excluída'})
+
+@app.route('/api/maquinas/<int:mid>/historico')
+def historico_maquina(mid):
+    conn = get_db()
+    maq = conn.execute('SELECT * FROM maquinas WHERE id=?', (mid,)).fetchone()
+    if not maq:
+        conn.close()
+        return jsonify({'error': 'Not found'}), 404
+    ordens = conn.execute('''SELECT o.*, r.nome as responsavel_nome FROM ordens o
+        LEFT JOIN responsaveis r ON o.responsavel_id = r.id
+        WHERE o.maquina_id = ? ORDER BY o.created_at DESC''', (mid,)).fetchall()
+    conn.close()
+    return jsonify({'maquina': dict(maq), 'ordens': [dict(o) for o in ordens]})
+
+# ── Responsáveis ────────────────────────────────────────
+
+@app.route('/api/responsaveis', methods=['GET'])
+def list_responsaveis():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM responsaveis ORDER BY nome').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/responsaveis', methods=['POST'])
+def create_responsavel():
+    data = request.json
+    if not data.get('nome'):
+        return jsonify({'error': 'Nome é obrigatório'}), 400
+    conn = get_db()
+    cur = conn.execute('INSERT INTO responsaveis (nome, email, telefone, especialidade) VALUES (?,?,?,?)',
+                       (data['nome'], data.get('email', ''),
+                        data.get('telefone', ''), data.get('especialidade', '')))
+    conn.commit()
+    conn.close()
+    return jsonify({'id': cur.lastrowid}), 201
+
+@app.route('/api/responsaveis/<int:rid>', methods=['PUT'])
+def update_responsavel(rid):
+    data = request.json
+    if not data.get('nome'):
+        return jsonify({'error': 'Nome é obrigatório'}), 400
+    conn = get_db()
+    conn.execute('UPDATE responsaveis SET nome=?, email=?, telefone=?, especialidade=? WHERE id=?',
+                 (data['nome'], data.get('email', ''),
+                  data.get('telefone', ''), data.get('especialidade', ''), rid))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': 'Responsável atualizado'})
+
+@app.route('/api/responsaveis/<int:rid>', methods=['DELETE'])
+def delete_responsavel(rid):
+    conn = get_db()
+    total = conn.execute('SELECT COUNT(*) as c FROM ordens WHERE responsavel_id=?', (rid,)).fetchone()['c']
+    if total > 0:
+        conn.close()
+        return jsonify({'error': f'Não é possível excluir: há {total} OS atribuída(s) a este responsável'}), 409
+    conn.execute('DELETE FROM responsaveis WHERE id=?', (rid,))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': 'Responsável excluído'})
+
+# ── Dashboard ────────────────────────────────────────────
+
+@app.route('/api/dashboard')
+def dashboard():
+    conn = get_db()
+    total      = conn.execute('SELECT COUNT(*) as c FROM ordens').fetchone()['c']
+    abertas    = conn.execute("SELECT COUNT(*) as c FROM ordens WHERE status='aberta'").fetchone()['c']
+    em_and     = conn.execute("SELECT COUNT(*) as c FROM ordens WHERE status='em_andamento'").fetchone()['c']
+    concluidas = conn.execute("SELECT COUNT(*) as c FROM ordens WHERE status='concluida'").fetchone()['c']
+    urgentes   = conn.execute(
+        "SELECT COUNT(*) as c FROM ordens WHERE prioridade='urgente' AND status NOT IN ('concluida','cancelada')"
+    ).fetchone()['c']
+
+    tempos = conn.execute("""
+        SELECT (julianday(fechado_at) - julianday(created_at)) * 24 as horas
+        FROM ordens WHERE status='concluida' AND fechado_at IS NOT NULL
+    """).fetchall()
+    tempo_medio = round(sum(r['horas'] for r in tempos) / len(tempos), 1) if tempos else 0
+
+    por_status = conn.execute(
+        'SELECT status, COUNT(*) as total FROM ordens GROUP BY status'
+    ).fetchall()
+
+    por_prioridade = conn.execute("""
+        SELECT prioridade, COUNT(*) as total FROM ordens
+        WHERE status NOT IN ('concluida','cancelada') GROUP BY prioridade
+    """).fetchall()
+
+    por_maquina = conn.execute("""
+        SELECT m.nome, COUNT(o.id) as total
+        FROM ordens o JOIN maquinas m ON o.maquina_id = m.id
+        GROUP BY m.id ORDER BY total DESC LIMIT 6
+    """).fetchall()
+
+    por_resp = conn.execute("""
+        SELECT r.nome, COUNT(o.id) as total,
+        SUM(CASE WHEN o.status='concluida' THEN 1 ELSE 0 END) as concluidas
+        FROM ordens o JOIN responsaveis r ON o.responsavel_id = r.id
+        GROUP BY r.id ORDER BY total DESC
+    """).fetchall()
+
+    por_dia = conn.execute("""
+        SELECT DATE(created_at) as dia, COUNT(*) as total
+        FROM ordens WHERE created_at >= date('now','-7 days')
+        GROUP BY dia ORDER BY dia
+    """).fetchall()
+
+    conn.close()
+    return jsonify({
+        'totais': {
+            'total': total, 'abertas': abertas, 'em_andamento': em_and,
+            'concluidas': concluidas, 'urgentes': urgentes, 'tempo_medio': tempo_medio
+        },
+        'por_status':      [dict(r) for r in por_status],
+        'por_prioridade':  [dict(r) for r in por_prioridade],
+        'por_maquina':     [dict(r) for r in por_maquina],
+        'por_responsavel': [dict(r) for r in por_resp],
+        'por_dia':         [dict(r) for r in por_dia],
+    })
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True, port=5050)
